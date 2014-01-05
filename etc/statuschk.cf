@@ -18,4 +18,5 @@ group test Test Services
   service ping_not_up		type=ping args=10.1.1.1
   service ping_not_up2		type=ping args=10.1.1.2
   service ping_not_up3		type=ping args=10.1.1.3
+  service www_www.google.com	type=httpgrep args="http://www.google.com/ Feeling Lucky"
 endgroup test
