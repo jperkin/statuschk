@@ -1,0 +1,21 @@
+# Config file for statuschk
+#
+# In Pager and Email lists, |<url>| is expanded to the contents of the URL
+# <team>_esc is used for escalated (i.e. "still DOWN") alarms
+#
+pager	default
+email	default		ops@example.com
+#
+# Miscellaneous options.
+#
+set	maxproc		1
+set	fromaddr	nobody@example.com
+set	sendmail	/usr/sbin/sendmail
+#
+group test Test Services
+  default			team=default domail=Y dopage=N
+  service ping_localhost	type=ping args=localhost
+  service ping_not_up		type=ping args=10.1.1.1
+  service ping_not_up2		type=ping args=10.1.1.2
+  service ping_not_up3		type=ping args=10.1.1.3
+endgroup test

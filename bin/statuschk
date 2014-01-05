@@ -1,0 +1,637 @@
+#!/usr/bin/env perl -w
+#
+# Copyright (c) 2008 Simon Lockhart, Bogons
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+# statuschk - Complete a run of service monitoring. Should be run from cron.
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use StatusChk;
+use Getopt::Std;
+use LWP;
+use Data::Dumper;
+
+use POSIX ":sys_wait_h";
+
+# Default config file location
+my $cfgfile = "$FindBin::Bin/../etc/statuschk.cf";
+
+# Where rmon status gets cached
+my $rmonstatusdir = "$FindBin::Bin/../rmon";
+
+# Where we store recent status changes
+my $statusdir = "$FindBin::Bin/../current";
+
+# Where we store history of status
+my $historydir ="$FindBin::Bin/../history";
+
+my @lt = localtime(time);
+my $date = sprintf("%04d%02d%02d", $lt[5]+1900, $lt[4]+1, $lt[3]);
+my $time = sprintf("%02d%02d", $lt[2], $lt[1]);
+my $time_run_start = time;
+
+my $int = 5;
+
+my %opt;
+getopts("d:", \%opt);
+my $debug = $opt{'d'} || 0;
+
+my %status;
+
+# We don't care about broken pipes (probably dead processes...)
+$SIG{PIPE} = 'IGNORE';
+
+if ($debug)
+{
+  open (STDERR, ">/var/tmp/statuschk.debug.$$") if ($debug > 1);
+
+  DEBUG("Main prog starting");
+}
+
+my $cfg = StatusChk::ReadConfig($cfgfile);
+
+# Remember when we started this run - means we can keep all timestamps the same
+my $time_start = time;
+
+my %kids;
+my $procs = 0;
+
+$SIG{'CHLD'} = \&Reap;
+
+# Create a child and a pipe to it...
+if ((my $pid_rx = open(STDOUT, "|-")) != 0)
+{
+  # Parent
+  DEBUG("Forked $pid_rx for receiver");
+
+  $kids{$pid_rx}->{running} = 1;
+  $kids{$pid_rx}->{service} = "Receiver";
+  $procs ++;
+}
+else
+{ 
+  # Child
+  StatusReceiver();
+  exit 0;  # In case that function forgets to exit...
+}
+
+my %seentype;
+my %type_error;
+my %max_run_time;
+
+foreach my $s (keys %{$cfg->{services}})
+{
+  my $svc = $cfg->{services}->{$s};
+
+  next if ($svc->{servtype} ne 'service');
+
+  DEBUG("$s: Starting");
+
+  # If this is the first time we've seen a service of this type, load the
+  # module for it
+  if (!$seentype{$svc->{type}})
+  {
+    $seentype{$svc->{type}} = 1;
+
+    my $type = $svc->{type};
+    DEBUG("$s: require StatusChk::$type");
+    eval "require StatusChk::$type";
+
+    # If the module breaks, don't die here, but raise an error on every
+    # service that tries to use it
+    $type_error{$type} = $@ if ($@);
+
+    # Look see if the module declares a max run time
+    eval "\$max_run_time{".$type."} = \$StatusChk::".$type."::max_run_time";
+    $max_run_time{$type} = $max_run_time{$type} || (60 * $int);
+  }
+
+  # Are we running too many procs at once?
+  while ($cfg->{var}->{maxproc} > 0 && $procs > $cfg->{var}->{maxproc})
+  {
+     sleep(1);
+
+     # See if there are any we can kill off because they're running too long
+     LookForDeadSvcs();
+  }
+
+  # Now fork to run our new service
+  if ((my $pid = fork) > 0)
+  {
+     # Parent
+     $kids{$pid}->{service} = $s;
+     $kids{$pid}->{running} = 1;
+     $kids{$pid}->{starttime} = time;
+     $kids{$pid}->{max_run_time} = $max_run_time{$svc->{type}};
+
+     DEBUG("Forked $pid for $s");
+
+     if (exists $kids{$pid}->{status})
+     {
+       # Crikey, it died already...
+       DEBUG("Pid $pid has died already!");
+       $kids{$pid}->{running} = 0;
+     }
+
+     $procs ++;
+  }
+  elsif ($pid == -1)
+  {
+     # Fork failed - we should probably die, but lets try to recover...
+     print "$s ERROR fork failed: $!\n";
+  }
+  else
+  {
+    # Child
+    RunService($svc);
+    exit 0;
+  }
+}
+
+while($procs > 0)
+{
+  sleep(1);
+
+  # If there's only 1 proc, it's probably the receiver - close our STDOUT
+  # which will cause it to finish
+  close(STDOUT) if ($procs == 1);
+
+  # See if there are any we can kill off because they're running too long
+  $procs = LookForDeadSvcs();
+}
+
+exit;
+
+#----------------------------------------------------------------------------
+sub DEBUG
+{
+ my ($msg) = @_;
+
+ if ($debug)
+ {
+   my ($ss, $mi, $hh) = localtime;
+   printf STDERR "%-5d: %02d:%02d:%02d: %s\n", $$, $hh, $mi, $ss, $msg;
+ }
+}
+
+
+sub Reap {
+  my $child;
+
+  while (($child = waitpid(-1,WNOHANG)) > 0) 
+  {
+    # Sometimes the process dies before we get a chance to record its 
+    # presence - handle this gracefully
+    if (exists $kids{$child})
+    {
+      $kids{$child}->{running} = 0;
+      DEBUG("PID $child (".$kids{$child}->{service}.") reaped");
+    }
+    else
+    {
+      DEBUG("PID $child (Early death!) reaped");
+    }
+
+    $kids{$child}->{status} = $?;
+
+    $procs --;
+  }
+
+  $SIG{'CHLD'} = \&Reap;  # still loathe sysV
+}
+
+sub StatusReceiver
+{
+  while (<STDIN>)
+  {
+    s/[\r\n]+$//;
+    DEBUG("RX: $_");
+
+    my ($service, $status, $reason) = split(/ /, $_, 3);
+
+    $status{$service}->{current}->{status} = $status;
+    $status{$service}->{current}->{reason} = $reason;
+  }
+
+  DEBUG("RX: End");
+
+  &DoRServices;
+  &DoAggServices;
+
+  &ProcessResults;
+  exit;
+}
+
+sub RunService
+{
+  my ($svc) = @_;
+
+  DEBUG("Doing $svc->{name}");
+
+  $0 = "statuschk: $svc->{name}";
+
+  my ($status, $reason);
+
+  # Throw an error if the module didn't load
+  if ($type_error{$svc->{type}})
+  {
+    $status = "ERROR";
+    #$reason = $type_error{$svc->{type}};
+    $reason = "Could not load module for $svc->{type}";
+  }
+  else
+  {
+    eval "(\$status, \$reason) = &StatusChk::$svc->{type}::check(\$svc)";
+    if ($@)
+    {
+      $reason = $@;
+      $status = "ERROR";
+    }
+  }
+  
+  $reason = "" if (!defined $reason); 	# Stop perl complaining
+  $reason =~ s/[\r\n]//g;
+
+  DEBUG("$svc->{name} $status $reason");
+  print "$svc->{name} $status $reason\n";
+}
+
+sub DoRServices
+{
+  foreach my $s (grep($cfg->{services}->{$_}->{servtype} eq 'rservice',
+                     keys %{$cfg->{services}}))
+  {
+    my ($status, $reason) = &RunRService($cfg->{services}->{$s});
+
+    $reason = "" if (!defined $reason);
+
+    $status{$s}->{current}->{status} = $status;
+    $status{$s}->{current}->{reason} = $reason;
+    DEBUG("$s: $status $reason");
+  }
+}
+
+sub RunRService
+{
+  my ($svc) = @_;
+
+  DEBUG("Doing RService $svc->{name}");
+
+  my $file = "${rmonstatusdir}/status.".$svc->{name};
+
+  if (!-f $file)
+  {
+    return "WARN", "No data from remote agent";
+  }
+
+  my @st = stat($file);
+  if ((time - $st[9]) > 600)
+  {
+    return "WARN", "Expired data from remote agent";
+  }
+
+  my $stat;
+  open(STAT, $file) || return "ERROR", "Can't open rmon status: $!";
+  $stat = <STAT>;
+  close(STAT);
+  $stat =~ s/[\r\n]*$//;
+  my ($status, $reason) = split(/ /, $stat, 2);
+
+  return $status, $reason;
+}
+
+sub DoAggServices
+{
+  foreach my $s (grep($cfg->{services}->{$_}->{servtype} eq 'aggservice',
+                     keys %{$cfg->{services}}))
+  {
+    my ($status, $reason) = &RunAggService($cfg->{services}->{$s});
+
+    $reason = "" if (!defined $reason);
+
+    $status{$s}->{current}->{status} = $status;
+    $status{$s}->{current}->{reason} = $reason;
+    DEBUG("$s: $status $reason");
+  }
+}
+
+sub RunAggService
+{
+  my ($svc) = @_;
+
+  my @depserv = split(' ', $svc->{args});
+
+  my $statuses;
+  foreach my $s (@depserv)
+  {
+    push(@{$statuses->{$status{$s}->{current}->{status}}}, $s);
+  }
+
+  my $numserv = scalar(@depserv);
+  my $numup = scalar(@{$statuses->{UP}});
+
+  my $downtxt = ($numserv - $numup) . " of ${numserv} services not up";
+  if ($numserv - $numup > 0)
+  {
+    $downtxt .= " (".join(", ", grep($status{$_}->{current}->{status} ne 'UP',
+                                        @depserv)).")";
+  }
+
+  my $type = $svc->{type};
+
+  DEBUG("AggService $svc->{name} : $type : $numup / $numserv");
+
+  if ($type eq 'one')
+  {
+    return("UP", undef) if ($numup >= 1);
+    return("DOWN", "No services UP");
+  }
+  elsif ($type eq 'all')
+  {
+    return("UP", undef) if ($numup == $numserv);
+    return("DOWN", $downtxt);
+  }
+  elsif ($type eq 'most')
+  {
+    return("UP", undef) if ($numup > ($numserv / 2));
+    return("DOWN", $downtxt);
+  }
+  else
+  {
+    return("ERROR", "Unknown aggregate type $type");
+  }
+}
+
+sub ProcessResults
+{
+  foreach my $s (keys %{$cfg->{services}})
+  {
+    &GetRecentServiceData($s);
+    &SaveServiceCurrent($s);
+    &SaveServiceHistory($s);
+
+    my $st_now = $status{$s}->{current}->{status};
+    my $st_last = $status{$s}->{hist}->[0]->{status} || "NEW";
+
+    my $r_now = $status{$s}->{current}->{reason};
+    my $r_last = $status{$s}->{hist}->[0]->{reason} || "";
+
+    # flatten the times to poll interval
+    my $timenowround = int($time_run_start / (60 * $int)) * $int;
+    my $timelastround = int($status{$s}->{hist}->[0]->{time} / (60*$int)) * $int;
+    my $timediff = $timenowround - $timelastround;
+
+    my $mail = "N";
+    my $page = "N";
+    my $still = "N";
+
+    my $esc = "N";
+    $esc = "Y" if ($timediff >= 60);
+
+    my $was = $st_last;
+
+    my $svc_domail = $cfg->{services}->{$s}->{domail} || "N";
+    my $svc_dopage = $cfg->{services}->{$s}->{dopage} || "N";
+
+    if ($st_now eq 'UP')
+    {
+### What about !UP -> WARN -> UP....? 
+      if ($timediff > 5) # Ignore it if it in previous state for <= 5 mins
+      {
+        if ($st_last eq 'WARN')		# WARN -> UP
+        {
+	  DEBUG("WARN -> UP, prev >5 mins");
+	  $mail = $svc_domail;
+	  $page = $svc_dopage if ($timediff >= 60);
+	}
+        elsif ($st_last ne 'UP') 	# !(WARN | UP) -> UP
+        {
+	  DEBUG("!(WARN | UP) -> UP, prev >5 mins");
+	  $mail = $svc_domail;
+	  $page = $svc_dopage;
+	}
+      }
+    }
+    elsif ($st_now eq 'DOWN')
+    {
+      if ($st_last eq 'DOWN')
+      {
+        if ($timediff == 5)
+        {
+	  DEBUG("DOWN -> DOWN, prev = 5 mins");
+          $was = $status{$s}->{hist}->[1]->{status};
+          $mail = $svc_domail;
+          $page = $svc_dopage;
+        }
+        elsif ($timediff >= 60 && ($timediff % 60) == 0)
+        {
+	  DEBUG("DOWN -> DOWN, prev = multiple of 60 mins");
+          $mail = $svc_domail unless ($svc_domail eq 'I');
+          $page = $svc_dopage unless ($svc_dopage eq 'I');
+          $still = "Y";
+        }
+      }
+    }
+    elsif ($st_now eq 'WARN')
+    {
+      if ($st_last ne 'UP')	# !UP -> WARN (i.e. still WARN or DOWN->WARN)
+      {
+        if ($timediff == 5)	 
+        {
+	  DEBUG("!UP -> WARN, prev = 5 mins");
+          $was = $status{$s}->{hist}->[1]->{status};
+          $mail = $svc_domail;
+        }
+        elsif ($timediff >= 60 && ($timediff % 60) == 0)
+        {
+	  DEBUG("!UP -> WARN, prev = multiple of 60 mins");
+          $mail = $svc_domail unless ($svc_domail eq 'I');
+          $page = $svc_dopage unless ($svc_dopage eq 'I');
+          $still = "Y";
+        }
+      }
+    }
+
+    if ($mail ne 'N')
+    {
+      &SendMail($s, $was, $still, $esc, $page);
+    }
+
+    if ($page ne 'N')
+    {
+      &SendPage($s, $was, $still, $esc);
+    }
+  }
+}
+
+sub GetRecentServiceData
+{
+  my ($s) = @_;
+
+  if (open(STATUS, "$statusdir/statuschk.$s"))
+  {
+    while (<STATUS>)
+    {
+      s/[\r\n]+$//;
+      my ($ot, $os, $or) = split(' ', $_, 3);
+
+      push(@{$status{$s}->{hist}}, { time=>$ot, status=>$os, reason=>$or});
+
+    }
+    close(STATUS);
+  }
+  else
+  {
+    $status{$s}->{hist}->[0] = {
+    			time => 0,
+			status => "NEW",
+			reason => "" 
+			};
+  }
+}
+
+sub SaveServiceCurrent
+{
+  my ($s) = @_;
+
+  my $st_now = $status{$s}->{current}->{status};
+  my $st_last = $status{$s}->{hist}->[0]->{status} || "NEW";
+
+  my $r_now = $status{$s}->{current}->{reason};
+  my $r_last = $status{$s}->{hist}->[0]->{reason} || "";
+
+print "SaveServiceCurrent($s)\n";
+#print Dumper($status{$s});
+
+  if ($st_now ne $st_last)
+  {
+    open(STATUS, ">$statusdir/statuschk.$s")
+                                || die "Can't write status: $!";
+    print STATUS join(" ",    $time_run_start,
+                                $status{$s}->{current}->{status},
+                                $status{$s}->{current}->{reason}),"\n";
+
+    print STATUS join(" ",    $status{$s}->{hist}->[0]->{time},
+                                $status{$s}->{hist}->[0]->{status},
+                                $status{$s}->{hist}->[0]->{reason}),"\n";
+    close(STATUS);
+  }
+  elsif ($r_now ne $r_last)
+  {
+    open(STATUS, ">$statusdir/statuschk.$s")
+                                || die "Can't write status: $!";
+    print STATUS join(" ",    $status{$s}->{hist}->[0]->{time},
+                                $status{$s}->{hist}->[0]->{status},
+                                $r_now),"\n";
+    print STATUS join(" ",    $status{$s}->{hist}->[1]->{time},
+                                $status{$s}->{hist}->[1]->{status},
+                                $status{$s}->{hist}->[1]->{reason}),"\n";
+    close(STATUS);
+  }
+}
+
+sub SaveServiceHistory
+{
+  my ($s) = @_;
+
+  mkdir("$historydir/${date}",0755);    # Just in case...
+  open(HISTORY, ">>$historydir/${date}/statuschk.$s") ||
+          open(HISTORY, ">$historydir/${date}/statuschk.$s") ||
+          die "Can't write history: $!";
+
+  print HISTORY join(" ",     $time_run_start,
+                              $status{$s}->{current}->{status},
+                              $status{$s}->{current}->{reason}),"\n";
+  close(HISTORY);
+}
+
+sub SendMail
+{
+  my ($s, $was, $still, $esc, $page) = @_;
+
+  my $email_to = &GetMailRecipients($s, $esc);
+
+  my $status = $status{$s}->{current}->{status};
+
+  DEBUG("Would email $email_to");
+  return if ($debug > 2);
+
+  open(MAIL, "| $cfg->{var}->{sendmail} -f $cfg->{var}->{fromaddr} -t") || die "Can't sendmail: $!";
+
+  print MAIL "From: Status Check <$cfg->{var}->{fromaddr}>\n";
+  print MAIL "To: $email_to\n";
+  print MAIL "Subject: Status: $s",($still)?" still ":" ", "$status\n";
+  print MAIL "\n";
+  close(MAIL);
+
+}
+
+sub GetMailRecipients
+{
+  my ($s, $esc) = @_;
+
+  my $team = $cfg->{services}->{$s}->{team};
+  my $email_to = $cfg->{team}->{$team}->{email};
+
+  if ($esc && exists($cfg->{team}->{$team . "_esc"}))
+  {
+    $email_to = $cfg->{team}->{$team . "_esc"}->{email};
+  }
+
+  my @email = map { s/^\|(.*)\|$/&GetURL($1)/e; $_ } @$email_to;
+  $email_to = join(",", @email);
+
+  return $email_to;
+}
+
+sub LookForDeadSvcs
+{
+  DEBUG("Looking for Dead Services... procs = $procs");
+
+  my $running_procs = 0;
+  foreach my $pid (sort keys %kids)
+  {
+    if ($kids{$pid}->{running})
+    {
+      DEBUG(" PID $pid (".$kids{$pid}->{service}.")");
+      if (kill(0, $pid) == 1)
+      {
+        $running_procs ++;
+        DEBUG(" PID $pid (".$kids{$pid}->{service}.") still running");
+	if ($kids{$pid}->{max_run_time} &&
+		($kids{$pid}->{starttime} + $kids{$pid}->{max_run_time} < time))
+	{
+	  DEBUG(" PID $pid ran for too long... killing it");
+	  kill(15, $pid);
+	  # Tell the receiver process what we did
+          print $kids{$pid}->{service}.
+	  		" ERROR Probe ran for too long and was killed\n";
+	}
+      }
+      else
+      {
+        # Process has died, and we've not noticed...
+        DEBUG(" PID $pid (".$kids{$pid}->{service}.") has gone away");
+	$kids{pid}->{running} = 0;
+	$procs --;
+      }
+    }
+  }
+
+  return $running_procs;
+}

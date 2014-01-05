@@ -1,0 +1,77 @@
+#!/usr/bin/env perl -w
+#
+# Copyright (c) 2006 Simon Lockhart, Bogons
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+# statustest - Test a single service
+#
+
+use strict;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib";
+use Getopt::Std;
+use StatusChk;
+
+my $cfgfile = "../etc/statuschk.cf";
+
+my %opt;
+getopts("s:t:a:", \%opt);
+
+my $svc;
+
+if ($opt{'s'})
+{
+  my $cfg = StatusChk::ReadConfig($cfgfile);
+
+  if (exists $cfg->{services}->{$opt{'s'}})
+  {
+    $svc = $cfg->{services}->{$opt{'s'}};
+  }
+  else
+  {
+    print STDERR "Unable to find service '".$opt{'s'}."' in config\n";
+    exit 1;
+  }
+}
+elsif ($opt{'t'} && $opt{'a'})
+{
+  $svc = {
+    name => 'statustest',
+    type => $opt{'t'},
+    args => $opt{'a'}
+  };
+}
+else
+{
+  print STDERR "Usage: statustest -s <service>\n";
+  print STDERR "       statustest -t <type> -a <args>\n";
+  exit 1;
+}
+
+my ($status, $reason);
+my $timeout;
+
+eval "require StatusChk::".$svc->{type};
+
+eval "\$timeout = \$\{StatusChk::".$svc->{type}."::max_run_time\}";
+$timeout = $timeout || "default";
+print "Max run time = ",$timeout,"\n";
+
+eval "(\$status, \$reason) = &StatusChk::".$svc->{type}."::check(\$svc)";
+die "$@" if $@;
+
+print "$status ";
+print $reason if defined($reason);
+print "\n";
