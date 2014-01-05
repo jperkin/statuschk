@@ -26,7 +26,7 @@ sub check
     }
     else
     {
-      return("DOWN", "URL does not contain " . $match);
+      return("DOWN", "URL does not contain \"" . $match . "\"");
     }
   }
   else
