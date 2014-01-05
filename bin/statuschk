@@ -419,7 +419,7 @@ sub ProcessResults
 	  $mail = $svc_domail;
 	  $page = $svc_dopage if ($timediff >= 60);
 	}
-        elsif ($st_last ne 'UP') 	# !(WARN | UP) -> UP
+        elsif ($st_last ne 'UP' && $st_last ne 'NEW') 	# !(WARN | UP) -> UP
         {
 	  DEBUG("!(WARN | UP) -> UP, prev >5 mins");
 	  $mail = $svc_domail;
