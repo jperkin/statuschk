@@ -398,7 +398,7 @@ sub ProcessResults
 
     my $mail = "N";
     my $page = "N";
-    my $still = "N";
+    my $still = 0;
 
     my $esc = "N";
     $esc = "Y" if ($timediff >= 60);
