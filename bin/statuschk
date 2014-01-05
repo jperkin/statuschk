@@ -1,4 +1,4 @@
-#!/usr/bin/env perl -w
+#!/usr/bin/env perl
 #
 # Copyright (c) 2008 Simon Lockhart, Bogons
 #
@@ -17,6 +17,7 @@
 # statuschk - Complete a run of service monitoring. Should be run from cron.
 #
 
+use warnings;
 use strict;
 
 use FindBin;
