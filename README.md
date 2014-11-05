@@ -16,4 +16,5 @@ This version works but the number of available modules is limited.
 * __ping__ ICMP ping host.
 * __rtsp__ RFC 2326 service check.
 * __smtp__ Check a SMTP service is running.
+* __ssl__ Check SSL certificates.
 * __tcp__ General TCP check.
